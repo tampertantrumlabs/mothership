@@ -10,7 +10,7 @@
 - **Map:** [`docs/superpowers/specs/2026-04-17-v1-spec-map-design.md`](./2026-04-17-v1-spec-map-design.md)
 - **Principles load-bearing:** P3 (primary — signed, capability-declared skills), P7 (install-time default-deny); P8 (every install event is audited)
 - **Use cases cited:** UC3 (primary — IT-signed distribution, SOC-approvable audit chain), UC2 (revocation/compliance-driven verification behavior, strict CRL/OCSP policy, grace-period handling), UC1 (solo-founder reuse of trusted skills across client contexts)
-- **Tier:** T1 (no substrate dependencies at design time; at install time consumes Supervisor + Audit log)
+- **Tier:** T1
 - **Upstream:** none at design time
 - **Downstream consumers:** Supervisor (T2 — bundle install approval flow, manifest registry), Broker + provenance (T3 — verified-manifest objects for capability matrix), Skill process isolation (T4 — runtime enforcement of declared manifest), Audit log (T1 — every install-event's payload shape is defined here)
 
@@ -51,11 +51,11 @@ Plugin bundles are the only way to install skills, agents, and hooks into a Moth
 
 A plugin bundle is a `.mship` file — a gzipped tar archive — that contains:
 
-1. A **canonical JSON descriptor** (`descriptor.json`) that is the authoritative, signed representation of everything in the bundle.
-2. A **DSSE envelope** (`signature.dsse`) over the canonical JSON descriptor, with embedded publisher cert chain and optional Rekor inclusion proof.
-3. **Payload files** whose hash, size, mode, and path are all pre-declared in the descriptor. Payloads are never consumed as independent sources of truth — only as byte-addressable content whose identity is checked against the verified descriptor.
+1. A **canonical JSON descriptor copy** (`descriptor.json`) containing the bundle descriptor in canonical JSON form. This file is required in the archive for operator inspection and interoperability, and it **MUST byte-match the DSSE envelope payload exactly**. It is a copy, not the source of truth.
+2. A **sigstore-style verification bundle** (`signature.dsse`) whose body is a standard DSSE envelope and whose wrapper carries the publisher cert chain, optional Rekor inclusion proof, and optional timestamping material. The DSSE envelope's payload bytes are the **authoritative source for cryptographic verification and for deriving the verified descriptor**. Exact field structure is specified in §"`signature.dsse` wrapper format" below.
+3. **Payload files** whose hash, size, media_type, and path are all pre-declared in the descriptor. Payloads are never consumed as independent sources of truth — only as byte-addressable content whose identity is checked against the verified descriptor.
 
-This inverts the earlier checksums-file approach: the descriptor is the one thing signed, and every payload file is validated against fields in the verified descriptor before any side effect occurs on the host system.
+This inverts the earlier checksums-file approach: the descriptor payload inside the DSSE envelope is the one thing signed; the archive's `descriptor.json` is a required byte-for-byte copy of that payload; every payload file is validated against fields in the verified descriptor before any side effect occurs on the host system.
 
 ### Archive layout
 
@@ -72,7 +72,7 @@ Manifest YAMLs are an **authoring-side convenience only** — operators edit YAM
 
 ### `descriptor.json` contents
 
-Canonical-JSON-serialized (RFC 8785 / JCS — same library used for audit log entries, same golden-vector parity requirement):
+Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specification as audit log entries; library choice is an open implementation question in both specs, with shared golden-vector parity the cross-spec correctness contract):
 
 ```json
 {
@@ -271,6 +271,55 @@ where `payload_type = "application/vnd.mship.bundle-descriptor+json"` and `paylo
 
 Because the descriptor embeds every manifest and every file entry (path + size + hash + mode + media_type), the DSSE signature transitively covers every byte that install would materialize.
 
+### `signature.dsse` wrapper format
+
+`signature.dsse` is a single JSON object that wraps a standard DSSE envelope together with verification material (cert chain + optional Rekor + optional timestamp). A pure DSSE envelope does not define fields for cert chains or transparency-log material, so Mothership specifies an explicit superset. The format aligns with sigstore's verification-bundle concept but uses field names specified here.
+
+```json
+{
+  "format_version": "mship-bundle-signature-v1",
+  "envelope": {
+    "payloadType": "application/vnd.mship.bundle-descriptor+json",
+    "payload": "<base64-standard of canonical_json(descriptor) bytes>",
+    "signatures": [
+      {
+        "keyid": "<hex publisher_cert_fingerprint OR empty string for sigstore-keyless>",
+        "sig": "<base64-standard of raw signature bytes>",
+        "algorithm": "ed25519" | "ecdsa-p256-sha256" | "ecdsa-p384-sha384" | "rsa-pss-sha256-3072" | "rsa-pss-sha256-4096"
+      }
+    ]
+  },
+  "verification_material": {
+    "cert_chain_pem": "<PEM-concatenated cert chain, leaf first, up to but not including the trust root>",
+    "rekor": {                                  // optional; present iff identity_method: sigstore
+      "entry_uuid": "<Rekor log entry UUID>",
+      "integrated_time_unix": 1712345678,       // seconds-since-epoch, from Rekor entry
+      "log_index": 12345678,
+      "log_id_hex": "<hex sha256 of Rekor log's public key>",
+      "inclusion_proof": {
+        "checkpoint_signed_note": "<signed checkpoint note as text>",
+        "hashes_hex": ["<hex>", "<hex>", "..."],
+        "tree_size": 20000000,
+        "root_hash_hex": "<hex>"
+      },
+      "canonicalized_body": "<base64-standard of the Rekor entry body (the exact bytes Rekor hashed)>"
+    },
+    "timestamps": []                             // reserved for V1.5+; must be [] in V1
+  }
+}
+```
+
+**Field constraints (V1):**
+
+- `format_version` MUST be exactly the string `"mship-bundle-signature-v1"`. Future format revisions get a different string; verifiers reject unknown versions with `signature-invalid`.
+- `envelope.signatures` MUST have exactly one entry in V1 (multi-signer is V2+).
+- Verification is over the DSSE PAE encoding as defined in §"What is signed" above — `payload` is base64-decoded to its canonical JSON bytes for PAE assembly. PAE input bytes, not the JSON wrapper bytes, are what the signature covers.
+- `cert_chain_pem` MUST contain at least the leaf publisher cert; roots are resolved from the operator's trust store, not from the envelope.
+- `rekor` MUST be present iff the publisher chose `identity_method: sigstore`; MUST be absent otherwise. Verifier rejects inconsistency with `signature-invalid`.
+- `timestamps` MUST be an empty array in V1. Non-empty → `signature-invalid`.
+
+**Parser discipline.** `signature.dsse` is parsed with duplicate-key rejection; any extra top-level field or unknown `verification_material` key → `signature-invalid`. The wrapper is strict-schema validated before any signature verification happens.
+
 ### Algorithms (V1)
 
 - **Primary:** Ed25519 (EdDSA). Small signatures, fast verification.
@@ -404,7 +453,8 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 **`descriptor-verified`** — signature, chain, revocation, manifest schema, cross-references all pass. Descriptor is durable; payload hashes are retained but no payload byte is yet on disk.
 
 - Parse `signature.dsse` (DSSE envelope). Parse `descriptor.json` **from the envelope payload bytes**, not from the archive's `descriptor.json` entry. The archive's `descriptor.json` entry is only a convenience for operator inspection — the authoritative bytes are in the signed envelope.
-- Verify the archive's `descriptor.json` byte-identical to the envelope payload — any drift → `rejected(descriptor-archive-mismatch)`.
+- Verify the archive's `descriptor.json` is byte-identical to the DSSE envelope payload — any drift → `rejected(descriptor-archive-mismatch)`.
+- **Canonical-form self-check** on the DSSE payload bytes: parse the payload as JSON with **duplicate-key rejection enabled** (fail-closed; no last-wins), then re-serialize via RFC 8785 / JCS, and require byte-for-byte equality with the original payload. If the payload does not survive parse+canonicalize round-trip identically → `rejected(descriptor-noncanonical)`. This defeats cross-language parser drift: a build tool that emits non-canonical JSON (wrong key order, non-NFC unicode, duplicate keys the parser last-wins-accepts, number-rendering variants) cannot produce a bundle that verifies. `bundle_hash = SHA-256(DSSE payload bytes)` is computed only after this check passes.
 - DSSE signature verification (PAE framing + cert public key). → `rejected(signature-invalid)` if fail.
 - Cert chain verify up to a trusted root (operator-local or sigstore-path). → `rejected(chain-untrusted | sigstore-trust-incomplete | cert-expired | cert-not-yet-valid)`.
 - Namespace check: publisher_id matches the chain-verifying root's `publisher_namespace_prefixes` (or the matched sigstore identity allowlist entry). → `rejected(publisher-namespace-not-owned)`.
@@ -748,6 +798,7 @@ These are implementation choices; resolving them does not change any contract in
 | 2026-04-19 | V0.2 consistency fixes post-Copilot PR review. | Fixed 11 consistency issues flagged by Copilot on PR #1: (a) cross-manifest references point to inlined descriptor manifests, not separate YAML files; (b) declared explicit `plugin.signature-failed` event shape; (c) added missing `reason_code` enum variants (`algorithm-mismatch`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `bundle-already-installed`) that were referenced but undeclared; (d) fixed `MThip\bundle` typo; (e) aligned `executables` field at bundle level (not per-manifest); (f) clarified YAML is authoring-only; (g) removed contradictory pre-suggestion language from the publisher-identity section and commented-out `default_grants` in the trust-root annotation schema; (h) replaced gzip-header-inspection decompression-bomb check with streaming-ratio + max-byte-cap approach (ISIZE is unreliable); (i) softened "each state transition emits audit event" overstatement; (j) aligned "corrupted archive" error-mode terminology to actual enum codes; (k) constrained manifest-parse-error `reason_detail` to sanitized location + opaque hash per taint rules. No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.3 second-round Copilot fixes. | Fixed 6 additional consistency issues on PR #1: (a) Scope now says "six-state journaled state machine" (was "nine-step procedure" leftover from pre-Codex draft); (b) `descriptor.entries[]` clarified to cover payload files only — `descriptor.json` + `signature.dsse` are structural/signature artifacts excluded from the bijection (circular-dependency note); (c) descriptor↔tar bijection scoped to `payloads/**`; added explicit structural-entry check + `tar-structural` on any non-payload non-metadata entry; (d) `staged` state verification tuple is `(path, size, sha256, media_type)` only — tar-header `mode` is advisory, never fails install; (e) declared `plugin.revocation-impact-reported` audit event shape alongside `plugin.uninstalled`; (f) exit checklist updated from "10 L4 scenarios" to "15 L4 scenarios" to match the L4 count. No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.4 third-round Copilot fixes. | Fixed 7 more issues on PR #1 — all leftover "step N" references from the pre-Codex numbered-step draft and two content-scope fixes: (a) Citations now include UC2 (cited in body for CRL/OCSP strict + grace-period but missing from Citations header); (b) Purpose reworded to scope this sub-spec to manifest-integrity + install-time verification; runtime enforcement explicitly delegated to T4; (c) DSSE PAE shorthand in the bundle-format summary aligned to the normative byte-sequence in §"What is signed"; (d) "step 5 expansion" for sigstore verification re-anchored to the `descriptor-verified` state sub-steps; (e) "Namespace enforcement at step 5" re-anchored to `descriptor-verified`; (f) `staged → committed` mode-application timing clarified: `staged` guarantees content integrity only with no chmod; authoritative modes are imposed on entry to `committed` as part of the commit-time unit of work alongside registry+grants write; (g) Principle compliance table's P7 and P2 rows re-anchored to the `reviewed` state; P8 row count corrected to seven declared event types (was six; `plugin.revocation-impact-reported` was added in V0.3 and the count wasn't updated); trust-level tension reworded to reflect V1's badge-only posture. No contract changes to downstream sub-specs. |
+| 2026-04-19 | V0.5 fourth-round Copilot fixes. | Fixed 5 more issues on PR #1, all structural: (a) **Tier** simplified to just `T1` (runtime relationships already expressed in Upstream/Downstream; "consumes Supervisor + Audit log" phrasing conflated tier with lifecycle); (b) archive-layout section now explicitly says `descriptor.json` is a **required byte-match copy** of the DSSE payload (the DSSE payload is the authoritative cryptographic source) — reconciles "authoritative, signed" language with later "DSSE payload is authoritative" language; (c) added full `signature.dsse` **wrapper format** specification: a JSON object combining a strict DSSE envelope with explicit verification-material fields (cert chain, Rekor proof, timestamps reserved for V1.5+); specifies parser discipline, field constraints, and version framing (DSSE alone does not define cert-chain or Rekor fields; Mothership's superset is now unambiguous); (d) removed library-prescription overreach from descriptor section (library choice is an open implementation question in both audit log and plugin specs; only RFC 8785 canonicalization + shared golden-vector parity is normative); (e) added explicit **canonical-form self-check** at `descriptor-verified` state: parse DSSE payload with duplicate-key rejection, re-serialize via JCS, require byte-equality with original before computing `bundle_hash`; defeats cross-language parser drift at verification time, not just build time. No contract changes to downstream sub-specs. |
 
 ---
 
