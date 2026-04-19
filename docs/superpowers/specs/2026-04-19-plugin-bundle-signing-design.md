@@ -30,7 +30,7 @@ Plugin bundles are the only way to install skills, agents, and hooks into a Moth
 - **Manifest schemas** — one per artifact kind: bundle, skill, agent, hook. Versioned, strict schema.
 - **Signing model** — operator-local trust root with optional sigstore (Rekor transparency log) augmentation. No Mothership-operated CA in V1.
 - **Publisher identity** — X.509 certs issued under an operator-chosen trust root; sigstore-keyless OIDC certs accepted when Rekor entry is present.
-- **Install-time verification** — nine-step procedure, atomic, all-or-nothing, audited.
+- **Install-time verification** — six-state journaled state machine (`received → descriptor-verified → reviewed → staged → committed → activated`), atomic, all-or-nothing, audited.
 - **Revocation** — local revocation store managed by operator; optional CRL/OCSP endpoint polling per trust root.
 - **Capability declarations** — skills and agents declare exact capability requirements; no implicit capabilities.
 - **Install-event audit shapes** — bundle install events (requested / approved / rejected / signature-verified / signature-failed) carry structured payloads declared here for the Audit log's event-type registry.
@@ -96,7 +96,12 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same library used for audit log en
       "mode": "0755",
       "entry_type": "file"
     }
-    /* ... one object per file in the bundle; no file may be extracted that is not in this list */
+    /* ... one object per PAYLOAD file (anything under payloads/**); no payload file may
+       be extracted that is not in this list. descriptor.json and signature.dsse are
+       structural/signature artifacts and are explicitly NOT included in entries[] —
+       including them would create a circular dependency (the signature would need to
+       hash itself). Their presence and byte-equality is verified by a separate rule
+       at descriptor-verified state. */
   ],
   "skills":  [ /* canonical-JSON-serialized skill manifests, inlined */ ],
   "agents":  [ /* canonical-JSON-serialized agent manifests, inlined */ ],
@@ -405,7 +410,9 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 - Namespace check: publisher_id matches the chain-verifying root's `publisher_namespace_prefixes` (or the matched sigstore identity allowlist entry). → `rejected(publisher-namespace-not-owned)`.
 - Revocation check (local store + optional CRL/OCSP per trust-root policy). Strict policy + revocation-source-unreachable → `rejected(revocation-check-unavailable)`. Lenient policy + unreachable → proceed with an audit warning.
 - Manifest schema validation on every embedded skill/agent/hook manifest. → `rejected(manifest-schema-invalid | manifest-cross-ref-invalid)`.
-- **Verify every tar entry's (path, size, hash) appears as exactly one object in `descriptor.entries[]` and vice-versa**; any extra tar entry OR any descriptor entry without a matching tar entry → `rejected(descriptor-tar-mismatch)`.
+- Verify the tar contains exactly one `descriptor.json` entry and exactly one `signature.dsse` entry at the archive root; missing or duplicate required metadata entries → `rejected(descriptor-tar-mismatch)`.
+- **Verify every tar file under `payloads/**` has exactly one matching object in `descriptor.entries[]` by `(path, size, hash)`, and vice-versa** (descriptor↔tar bijection, payloads only; the two structural entries above are explicitly excluded); any extra payload tar entry OR any descriptor entry without a matching payload tar entry → `rejected(descriptor-tar-mismatch)`.
+- Any tar entry outside `payloads/**` that is not exactly `descriptor.json` or `signature.dsse` → `rejected(tar-structural)`.
 - `plugin.signature-verified` audit event emitted.
 - Transition → `reviewed` (if transitions to review) or `rejected(<reason>)`.
 
@@ -417,11 +424,11 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 - Operator approval → `plugin.install-approved` audit event **NOT yet emitted** (approval is recorded in the journal; the event is emitted at `activated` so the audit log reflects reality only after the bundle is actually live).
 - Transition → `staged` or `rejected(<reason>)`.
 
-**`staged`** — payload files have been materialized to disk in an isolated install directory (`installs/<install_event_id>/payload/`), each file verified against its declared `(size, sha256, mode, media_type)` before any byte is fsynced to its final path. Files are **not** yet visible to the registry or the broker.
+**`staged`** — payload files have been materialized to disk in an isolated install directory (`installs/<install_event_id>/payload/`), each file verified against its declared `(path, size, sha256, media_type)` before any byte is fsynced to its final path. Declared tar/header `mode` is advisory metadata only and does **not** participate in pass/fail verification — file permissions are operator-owned (see below). Files are **not** yet visible to the registry or the broker.
 
-- For each `descriptor.entries[]` object: re-open the tar archive, stream the entry's bytes, compute SHA-256 progressively, compare against declared hash, write to a temp path in `payload/.partial/`, fsync, rename atomically to `payload/<path>` only on full-match.
-- Any per-entry mismatch → `rejected(entry-hash-mismatch)`; all partially-materialized files are deleted; the tarball stays in quarantine for operator inspection.
-- Modes are applied **after** content verification: `chmod 0644` by default, `0755` only for entries whose paths appear in the bundle manifest's `executables` field (`bundle.yaml.executables`) as represented in the descriptor.
+- For each `descriptor.entries[]` object: re-open the tar archive, stream the entry's bytes, compute SHA-256 progressively, compare against declared hash, validate declared `media_type` is in the allowlist for bundle payloads, write to a temp path in `payload/.partial/`, fsync, rename atomically to `payload/<path>` only on full-match.
+- Any per-entry content mismatch (size, SHA-256, or disallowed media_type) → `rejected(entry-hash-mismatch)`; all partially-materialized files are deleted; the tarball stays in quarantine for operator inspection. A tar-header `mode` differing from the descriptor's declared `mode` does **not** abort install — supervisor imposes authoritative modes at the next step.
+- Supervisor-authoritative modes are applied **after** content verification: `chmod 0644` by default, `0755` only for entries whose paths appear in the bundle manifest's `executables` field (`bundle.yaml.executables`) as represented in the descriptor.
 - Transition → `committed`.
 
 **`committed`** — the bundle's manifests are registered with the supervisor's verified-manifest registry, grants are recorded in the grant ledger (from `reviewed` state's approvals), and the broker has **not yet** been told about them. This is the last rollback point.
@@ -467,6 +474,7 @@ Declared here for import into the audit log's event registry:
 - `plugin.install-rejected` — `{install_event_id, bundle_hash?, bundle_id?, version?, state_at_rejection, reason_code, reason_detail}` where `reason_code` is the full enum (`size-exceeded`, `decompression-bomb`, `path-escape`, `duplicate-entry`, `tar-structural`, `descriptor-archive-mismatch`, `signature-invalid`, `algorithm-mismatch`, `chain-untrusted`, `sigstore-trust-incomplete`, `cert-expired`, `cert-not-yet-valid`, `cert-revoked`, `revocation-check-unavailable`, `publisher-namespace-not-owned`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `rekor-proof-invalid`, `oidc-identity-not-allowlisted`, `manifest-schema-invalid`, `manifest-cross-ref-invalid`, `descriptor-tar-mismatch`, `entry-hash-mismatch`, `bundle-already-installed`, `operator-rejected`, `operator-timeout`, `registry-txn-failed`). This remains the terminal install-failure event, including cases preceded by `plugin.signature-failed`.
 - `plugin.install-approved` — `{install_event_id, bundle_hash, bundle_id, version, publisher_id, publisher_cert_fingerprint, identity_method, trust_level, grants_approved: [capability]}` (emitted at `activated`)
 - `plugin.uninstalled` — `{bundle_hash, bundle_id, reason: "operator" | "operator-rollback" | "revoked-publisher" | "superseded-by-version", grants_revoked: [capability]}`
+- `plugin.revocation-impact-reported` — `{revocation_event_id, revoked_cert_fingerprint, trust_root_fingerprint?, sigstore_identity_subject?, scope: "publisher" | "root" | "sigstore-identity", affected_bundles: [{bundle_hash, bundle_id, version, grants_active_count, skill_processes_running_count}], agents_with_in_flight_intents_count, action: "automatic-deactivate" | "operator-approve-required"}`. Emitted immediately before the corresponding cascade of `plugin.uninstalled(reason: "revoked-publisher")` entries, per the revocation flow in §"Revocation — deactivate first, delete later".
 
 **`reason_detail` payload hygiene:** strictly-limited format per audit log payload-taint rules. Control-character-free ASCII or NFC-normalized UTF-8; max 256 bytes; no embedded bundle content (no YAML/JSON fragments from the bundle, no tar metadata, no paths from the bundle's `entries[]`). The audit linter fails CI if any `reason_code` maps to a `reason_detail` generator that can include unsanitized bundle content. Operator inspection of the quarantined bundle contents is separate from audit log — audit log sees only the reason code and a sanitized-digest of the failing field.
 
@@ -727,7 +735,7 @@ These are implementation choices; resolving them does not change any contract in
 - [ ] Implementation passes unit + integration test suite (L1 + L2 + L3)
 - [ ] Integration tests with direct tier-dependencies pass (Audit log event shapes registered in `audit-events.yaml`; Supervisor manifest registry consumes typed verified-manifest objects)
 - [ ] Principle compliance check re-run; any tensions logged with resolution (two tensions noted above with resolution paths)
-- [ ] Spec-specific acceptance test passes (all 10 L4 tamper-and-trust scenarios in CI; audit entry correctness verified)
+- [ ] Spec-specific acceptance test passes (all 15 L4 tamper-and-trust scenarios in CI; audit entry correctness verified)
 
 ---
 
@@ -738,6 +746,7 @@ These are implementation choices; resolving them does not change any contract in
 | 2026-04-19 | V0 design drafted (Gavin + Cowork). | Third sub-spec authored under the V1 spec map (T1, design Phase I). Resolves `design-principles.md` open question 2 (signing authority = operator-local trust + optional sigstore; no Mothership CA in V1). |
 | 2026-04-19 | V0.1 revision post-Codex review. | Switched from `checksums.txt` + detached signature to **DSSE envelope over a canonical JSON descriptor** (eliminates canonicalization drift; binds all manifests + file metadata in a single signed subject). Reframed install as a **journaled state machine** (`received → descriptor-verified → reviewed → staged → committed → activated`) with crash-recoverable transitions and no payload materialization before descriptor verification. Added **publisher-namespace constraints** on trust roots (prevents two roots both issuing the same publisher_id). **Dropped trust-level grant pre-suggestion** in V1 (Codex flagged rubber-stamping risk; badges-only for now, revisit in V1.5 with design-partner evidence). Revocation **split into deactivate / delete / re-activate** phases with operator-presence-gated break-glass for root-level revocations + impact report before deactivation. Expanded sigstore verification to detail Fulcio chain, SCT via CT log keys, Rekor checkpoint consistency, OIDC issuer+subject binding, namespace-constrained sigstore identity allowlist. Replaced YAML-in-bundle with **canonical JSON descriptor** (YAML is authoring-side only; eliminates parser divergence across Rust/TS/Python). Added reason_detail taint rules. 15 L4 acceptance tests, extensive L2 hostile-corpus + differential tests for canonicalization drift. See Codex Review section below. |
 | 2026-04-19 | V0.2 consistency fixes post-Copilot PR review. | Fixed 11 consistency issues flagged by Copilot on PR #1: (a) cross-manifest references point to inlined descriptor manifests, not separate YAML files; (b) declared explicit `plugin.signature-failed` event shape; (c) added missing `reason_code` enum variants (`algorithm-mismatch`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `bundle-already-installed`) that were referenced but undeclared; (d) fixed `MThip\bundle` typo; (e) aligned `executables` field at bundle level (not per-manifest); (f) clarified YAML is authoring-only; (g) removed contradictory pre-suggestion language from the publisher-identity section and commented-out `default_grants` in the trust-root annotation schema; (h) replaced gzip-header-inspection decompression-bomb check with streaming-ratio + max-byte-cap approach (ISIZE is unreliable); (i) softened "each state transition emits audit event" overstatement; (j) aligned "corrupted archive" error-mode terminology to actual enum codes; (k) constrained manifest-parse-error `reason_detail` to sanitized location + opaque hash per taint rules. No contract changes to downstream sub-specs. |
+| 2026-04-19 | V0.3 second-round Copilot fixes. | Fixed 6 additional consistency issues on PR #1: (a) Scope now says "six-state journaled state machine" (was "nine-step procedure" leftover from pre-Codex draft); (b) `descriptor.entries[]` clarified to cover payload files only — `descriptor.json` + `signature.dsse` are structural/signature artifacts excluded from the bijection (circular-dependency note); (c) descriptor↔tar bijection scoped to `payloads/**`; added explicit structural-entry check + `tar-structural` on any non-payload non-metadata entry; (d) `staged` state verification tuple is `(path, size, sha256, media_type)` only — tar-header `mode` is advisory, never fails install; (e) declared `plugin.revocation-impact-reported` audit event shape alongside `plugin.uninstalled`; (f) exit checklist updated from "10 L4 scenarios" to "15 L4 scenarios" to match the L4 count. No contract changes to downstream sub-specs. |
 
 ---
 
