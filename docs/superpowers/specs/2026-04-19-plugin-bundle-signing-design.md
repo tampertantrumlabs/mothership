@@ -78,13 +78,13 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specificatio
 {
   "schema_version": 1,
   "bundle_identity": {
-    "bundle_id": "tamper-tantrum-labs/inbox-triage",
-    "version": "1.4.2",
-    "display_name": "Inbox Triage",
+    "bundle_id": "tamper-tantrum-labs/inbox-triage",    /* MUST be "<publisher_id>/<local_name>"; each segment matches ^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$ */
+    "version": "1.4.2",                                 /* MUST be semver 2.0.0 compliant */
+    "display_name": "Inbox Triage",                     /* UI only; not used for identity or policy */
     "description": "Inbox triage agent with per-client isolation.",
-    "publisher_id": "tamper-tantrum-labs",
-    "publisher_display_name": "TamperTantrum Labs",
-    "identity_method": "operator-trust",        /* "operator-trust" | "sigstore" — which verification path applies */
+    "publisher_id": "tamper-tantrum-labs",              /* MUST match ^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$ — ASCII lowercase only */
+    "publisher_display_name": "TamperTantrum Labs",     /* UI only; not used for identity or policy */
+    "identity_method": "operator-trust",                /* "operator-trust" | "sigstore" — which verification path applies */
     "created_at": "2026-04-19T14:32:00Z"
   },
   "runtime_constraints": {
@@ -140,11 +140,23 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specificatio
 
 **All manifests live inside `descriptor.json`.** There are no separate manifest files inside the archive. This binds every manifest byte to the single signed subject.
 
+### `bundle_identity` grammar (normative)
+
+`publisher_id` and `bundle_id` are security-critical identifiers used by install review, publisher-namespace policy, and audit correlation. Their syntax is normative — not display-defined — so the spec forbids implementations from applying Unicode normalization, case-folding, locale-sensitive comparison, or confusable-mapping during verification. Identifiers are compared by **exact byte comparison**.
+
+- `publisher_id` MUST match `^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$` — ASCII lowercase letters, digits, interior `-`; no leading or trailing `-`; max length 64 bytes.
+- `bundle_id` MUST be exactly `<publisher_id>/<local_name>`, where `<local_name>` independently matches the same grammar as `publisher_id`. The separator is a single ASCII `/`; no other Unicode slashes are permitted.
+- `version` MUST conform to Semantic Versioning 2.0.0.
+- `created_at` MUST be RFC 3339 UTC with second or sub-second precision (`Z` suffix required).
+- `identity_method` MUST be exactly one of the two ASCII literals `"operator-trust"` or `"sigstore"`.
+
+The verifier at `descriptor-verified` MUST reject — with `manifest-schema-invalid` — any descriptor whose `publisher_id` or `bundle_id` contains non-ASCII characters, uppercase letters, Unicode normalization variants, visually-confusable characters, extra path separators, empty segments, or otherwise fails the grammar. Because only ASCII lowercase is admissible, there is no valid mixed-case form to normalize; invalid syntax is **rejected**, not normalized. Build tooling MUST emit only this form.
+
 ### Invariants
 
 - **Identity = hash of descriptor payload bytes.** `bundle_hash = SHA-256(DSSE payload bytes)`. Those payload bytes **MUST** be RFC 8785 / JCS-canonical JSON encoding the descriptor — the verifier enforces this via the canonical-form self-check in `descriptor-verified` before any use of the payload bytes for hashing or manifest extraction. This is what every audit event references. Two archives with identical DSSE payload bytes have the same `bundle_hash` regardless of how payloads are arranged on disk inside the tar; that `bundle_hash` value equals `SHA-256(canonical_json(descriptor))` because canonical JSON is required and checked.
 - **No file materialized before descriptor verification.** Signature is verified → descriptor parsed → Rekor / chain / revocation checks pass → only then may any payload file be written to disk, and only for a regular-file tar entry whose canonicalized path is in a one-to-one match with an `entries[]` object AND whose `(path, size, sha256)` tuple matches that object exactly. `descriptor.entries[].media_type` is validated as descriptor metadata against the allowed payload-media-type set (and any policy keyed on that value); it is not compared against a tar-header field or inferred from payload bytes during tar↔descriptor matching. Tar-header `mode` is not part of the descriptor↔tar acceptance check.
-- **Archive parser is the adversary.** Tar entries with duplicate paths, `..`, absolute paths, Windows drive letters / UNC prefixes, NTFS ADS colons, path length > 1024 bytes, non-NFC Unicode, case-insensitive collisions (on case-insensitive hosts), symlinks, hardlinks, FIFOs, device files, pax headers with semantic side effects, or sparse files are all rejected at parse. Only regular-file tar entries are accepted.
+- **Archive parser is the adversary.** Tar entries with duplicate paths, `..`, absolute paths, Windows drive letters / UNC prefixes, NTFS ADS colons, path length > 1024 bytes, non-NFC Unicode, case-insensitive collisions (on case-insensitive hosts), symlinks, hardlinks, FIFOs, device files, or sparse files are all rejected at parse. **Pax is not permitted in V1:** any pax extended-header entry (tar type `x`) or global pax header (type `g`) causes bundle rejection, and no pax key is honored for `path`, `linkpath`, `size`, `mtime`, uid/gid, sparse metadata, or any other semantic override. Only regular-file tar entries encoded without pax headers are accepted. Each rejected condition maps to `rejected(tar-structural)` unless a more specific reason code fits (e.g., `path-escape`, `duplicate-entry`).
 - **Decompression bounds.** Uncompressed descriptor + payloads max 100 MiB in V1 (operator-configurable). Gzip compression ratio > 20:1 is rejected as a decompression-bomb signal before full decompression.
 - **Canonical path comparison.** Paths in `descriptor.entries[]` are compared against tar entries after NFC normalization + forward-slash separators + explicit rejection of any `./` prefix, trailing slash, or empty segment. No ambiguity between `payloads/x/y` and `./payloads/x/y`.
 - **File permissions are operator-owned, not bundle-owned.** The descriptor may declare an intended mode for audit/policy purposes, but tar-header mode is **not** part of the descriptor↔tar acceptance check and a mode mismatch does not by itself fail install. Supervisor imposes authoritative modes at commit time (`0644` for files, `0755` only for executable payloads whose paths are explicitly listed in the bundle manifest's `executables` field (`bundle.yaml.executables`), as represented in the descriptor).
@@ -349,7 +361,9 @@ Because the descriptor embeds every manifest and every file entry (path + size +
 - **Primary:** Ed25519 (EdDSA). Small signatures, fast verification.
 - **Accepted:** ECDSA on P-256 or P-384 with SHA-256/SHA-384 (required for sigstore Fulcio compatibility — Fulcio's default EKU issues ECDSA-P256 certs).
 - **Accepted:** RSA-PSS with SHA-256, key size ≥ 3072 bits (supports publishers with existing RSA PKI).
-- **Rejected:** RSA-PKCS#1 v1.5, DSA, ECDSA with nonrandom k, any SHA-1 or MD5 anywhere in the signature or cert chain.
+- **Rejected:** RSA-PKCS#1 v1.5, DSA, any SHA-1 or MD5 anywhere in the signature or cert chain.
+
+For ECDSA, install-time verification enforces only concrete, observable properties: approved curve/digest pairs (P-256 + SHA-256, P-384 + SHA-384), standard DER-encoded `(r, s)` signatures (non-DER encodings — e.g., sigstore's raw `r||s` — accepted only if explicitly declared by the envelope's signature algorithm field), and normal certificate path validation. **Verifiers do NOT attempt to determine from the signature whether the signer used random, deterministic, or biased nonce generation** — that property is not observable from a single signature. Publisher and build-signing tooling that emits ECDSA signatures MUST use deterministic RFC 6979 nonce generation or a vetted cryptographic library / HSM that provides equivalent nonce-generation protections. This is a producer-side requirement (enforced by build-tool policy), not a consumer-side check.
 
 The publisher's cert declares the algorithm; the DSSE envelope's signature algorithm must match. Cross-algorithm mixes are rejected at install.
 
@@ -361,17 +375,19 @@ The annotation file is where namespace constraints live:
 
 ```yaml
 trust_level: "community" | "verified" | "organization"
-publisher_namespace_prefixes:              # which publisher_ids this root may issue
-  - "tamper-tantrum-labs/*"                # owns publishers starting with this prefix
-  - "tamper-tantrum-labs-*"                # explicit alternates
+owned_publisher_ids:                       # exact-match list of publisher_ids this root is authorized to issue
+  - "tamper-tantrum-labs"
+  - "tamper-tantrum-labs-beta"
 revocation:
   crl_url: "https://..."
   ocsp_url: "https://..."
   policy: "strict" | "lenient"             # strict fails install on revocation unknown/unreachable
-notes: "TT Labs organization root; owns tamper-tantrum-labs namespace."
+notes: "TT Labs organization root; owns tamper-tantrum-labs and tamper-tantrum-labs-beta."
 ```
 
-**Namespace enforcement during the `descriptor-verified` state** (after cert-chain verification, before revocation check). The publisher cert's subject / URI SAN must match a prefix in the chain-verifying root's `publisher_namespace_prefixes`. A root that trust-chains but whose namespace prefixes do not cover the bundle's `publisher_id` causes install to abort with `publisher-namespace-not-owned`. This prevents two trusted roots from silently both issuing `tamper-tantrum-labs/*` — only one root may own that prefix in a given trust store, and `mothership trust add` detects collisions and refuses.
+**Pattern language (V1): literal exact-match only.** `owned_publisher_ids` is a list of **literal `publisher_id` strings**. No globs, no prefix wildcards, no regex. A bundle's `publisher_id` must appear in the list by exact byte comparison. A root that wants to own multiple related names must enumerate each one. Choosing a literal-list pattern (rather than glob/regex) keeps **collision detection** O(n) simple — two roots collide if and only if the intersection of their `owned_publisher_ids` is non-empty. Richer pattern forms (prefix globs, etc.) are a V1.5+ consideration with an explicit pattern language + collision-detection algorithm specified then.
+
+**Namespace enforcement during the `descriptor-verified` state** (after cert-chain verification, before revocation check). The bundle's `publisher_id` (subject to the grammar in §"`bundle_identity` grammar") must appear **by exact byte match** in the chain-verifying root's `owned_publisher_ids`. A root that trust-chains but does not explicitly own the bundle's `publisher_id` causes install to abort with `publisher-namespace-not-owned`. `mothership trust add` enforces collision at add-time: if a proposed root's `owned_publisher_ids` intersect any existing root's `owned_publisher_ids` set, the add is refused with `trust-store-namespace-collision`; if a collision is detected at install time (out-of-band trust-store modification), install aborts with the same reason code.
 
 V1 ships with **no default trust roots**. Operator action is required before any bundle installs. Realizes P7 at installer layer.
 
@@ -401,16 +417,19 @@ Operators who don't opt in to sigstore have zero entries in their sigstore ident
 identities:
   - subject: "bundle-publishers@tampertantrumlabs.com"
     issuer: "https://accounts.google.com"
-    publisher_namespace_prefixes:          # identity is ALSO namespace-constrained
-      - "tamper-tantrum-labs/*"
+    owned_publisher_ids:                   # identity is ALSO namespace-constrained — literal exact-match list
+      - "tamper-tantrum-labs"
+      - "tamper-tantrum-labs-beta"
   - subject: "releases@apisec.example"
     issuer: "https://github.com/login/oauth"
-    publisher_namespace_prefixes:
-      - "apisec/*"
+    owned_publisher_ids:
+      - "apisec"
 rekor_root_public_key: /etc/mothership/trust/rekor-root.pub
 fulcio_root_certs: /etc/mothership/trust/fulcio-roots.pem
 sigstore_ct_log_keys: /etc/mothership/trust/ct-log-keys.pem
 ```
+
+Sigstore-identity namespace matching uses the **same literal exact-match rule** as operator-trust roots (see §"Trust roots and namespace constraints"). Collisions between sigstore identities are detected the same way (intersection of `owned_publisher_ids` sets); operator-trust roots and sigstore identities are collision-checked against each other too so that a publisher_id is uniquely owned across the entire trust configuration.
 
 Missing any one of `rekor_root_public_key`, `fulcio_root_certs`, `sigstore_ct_log_keys` at install-time aborts all sigstore-signed-bundle installs with `sigstore-trust-incomplete`; never a silent fallback to a weaker path.
 
@@ -507,9 +526,9 @@ State persistence uses an **append-only journal** at `/var/lib/mothership/instal
 - **`staged` guarantees content integrity only.** No authoritative `chmod` happens in `staged`; the payload tree is materialized with OS-default modes. Authoritative modes are imposed on entry to `committed` (below).
 - Transition → `committed`.
 
-**`committed`** — on entry: supervisor applies authoritative modes to the already-verified payload tree (`0644` by default, `0755` only for entries whose paths appear in the bundle manifest's `executables` field (`bundle.yaml.executables`) as represented in the descriptor); the bundle's manifests are registered with the supervisor's verified-manifest registry; grants are recorded in the grant ledger (from `reviewed` state's approvals). Broker has **not yet** been told about them. This is the last rollback point.
+**`committed`** — on entry: supervisor (a) applies authoritative modes to the already-verified payload tree (`0644` by default, `0755` only for entries whose paths appear in the bundle manifest's `executables` field (`bundle.yaml.executables`) as represented in the descriptor), (b) atomically renames `installs/<install_event_id>/payload/` to the canonical bundle path `bundles/<bundle_hash>/` — if that path already exists from a prior install of the identical bundle_hash, the rename is skipped and the existing canonical payload is adopted (content-addressable dedup; two install events producing the same bundle_hash share one payload on disk), (c) registers the bundle's manifests with the supervisor's verified-manifest registry keyed by `bundle_hash`, and (d) records grants in the grant ledger from `reviewed` state's approvals. Broker has **not yet** been told about them. This is the last rollback point.
 
-- The commit-time unit of work = authoritative mode application **plus** the registry + grants write. Registry + grants write is a single supervisor-in-process database transaction (candidate: SQLite WAL or an append-only typed log). Failure in mode application OR mid-transaction → restart from `staged` on recovery; no partial `committed` state is observable.
+- The commit-time unit of work = authoritative mode application **plus** canonical rename **plus** registry + grants write. Registry + grants write is a single supervisor-in-process database transaction (candidate: SQLite WAL or an append-only typed log). Failure at any sub-step → restart from `staged` on recovery; no partial `committed` state is observable. The canonical rename is idempotent (re-running after a crash where the rename already landed is a no-op).
 - Transition → `activated`.
 
 **`activated`** — supervisor signals broker to reload manifests. Broker's capability matrix incorporates the new bundle's skills, agents, and hooks. `plugin.install-approved` audit event is emitted *here* with the full payload; the audit log now reflects a live bundle.
@@ -536,7 +555,7 @@ Journal existence across supervisor restart is what makes install recoverable; t
 `mothership plugin rollback <install_event_id>` — valid only for installs in states `committed` or `activated`:
 
 - If `activated`: deactivate (broker stops offering the bundle's skills/agents), revoke grants, emit `plugin.uninstalled(reason: operator-rollback)`.
-- If `committed` or `activated`: unregister from manifest registry; move `payload/` to `installs/<install_event_id>/rolled-back-payload/` for N days (default 7), then purge.
+- If `committed` or `activated`: unregister from manifest registry; move the canonical payload from `bundles/<bundle_hash>/` to `rolled-back-bundles/<bundle_hash>/` for N days (default 7), then purge. If multiple install events reference the same `bundle_hash`, rollback of any one deactivates them all — the canonical payload is shared and rolling back a `bundle_hash` rolls back every install-event pointing at it.
 
 Rollback is re-auth-gated and audited. Distinct from `uninstall` (which is the routine operator-initiated removal path). Rollback explicitly acknowledges the previous activation; uninstall does not require the previous-state pedigree.
 
@@ -558,11 +577,13 @@ Declared here for import into the audit log's event registry:
 
 ## Revocation — deactivate first, delete later
 
-Revocation splits into three distinct operations with separate authority and risk profiles:
+Revocation splits into three distinct operations with separate authority and risk profiles.
 
-1. **Deactivate** — atomic, synchronous, non-destructive. Broker stops routing to the revoked bundle's skills/agents/hooks. Grants are revoked. Skill processes tied to the bundle are stopped. Bundle state remains on disk, manifests remain in the registry (flagged `deactivated`). Audit entry `plugin.uninstalled(reason: revoked-publisher)` emitted.
-2. **Delete** — manual or scheduled after a grace period. Moves the bundle's payload out of the active install tree into `revoked-bundles/<bundle_hash>/` for operator forensic review; after N days (default 30) the payload is purged from disk.
-3. **Re-activate** — possible during the grace period before delete. Operator may mark a revocation as a false alarm (re-auth gated, separately audited); bundle is returned to `activated` state. After delete, re-activation requires a fresh install.
+**Authoritative on-disk location model.** `installs/<install_event_id>/payload/` is a per-install **staging path** only. A successful `staged → committed` transition **atomically renames the payload tree into the canonical active bundle path** `bundles/<bundle_hash>/`. The install-event record remains as audit/history metadata and points at the committed `bundle_hash`; uninstall, rollback, deactivate, and delete all resolve the payload **via `bundle_hash`, not by retaining multiple live payload copies per `install_event_id`**. If multiple install events produce the same `bundle_hash` (e.g., the same bundle is re-presented), they all refer to the single committed payload at `bundles/<bundle_hash>/` — no duplication.
+
+1. **Deactivate** — atomic, synchronous, non-destructive. Broker stops routing to the revoked bundle's skills/agents/hooks. Grants are revoked. Skill processes tied to the bundle are stopped. The committed payload remains on disk at `bundles/<bundle_hash>/`; manifests remain in the registry flagged `deactivated`. Audit entry `plugin.uninstalled(reason: revoked-publisher)` emitted.
+2. **Delete** — manual or scheduled after a grace period. Moves the committed payload from `bundles/<bundle_hash>/` into `revoked-bundles/<bundle_hash>/` for operator forensic review. Install-event audit records remain unchanged and continue to reference that `bundle_hash`. After N days (default 30) the payload is purged from disk.
+3. **Re-activate** — possible during the grace period before delete, provided the committed payload is still present at `bundles/<bundle_hash>/` (deactivate happened; delete has not yet moved it to `revoked-bundles/<bundle_hash>/`). Operator may mark a revocation as a false alarm (re-auth gated, separately audited); bundle is returned to `activated` state without creating a new install event. After delete, re-activation requires a fresh install because the canonical committed payload is no longer in the active bundle path.
 
 ### Local revocation store
 
@@ -638,7 +659,7 @@ Trust-level annotation is still useful for revocation policy selection and audit
 
 **Archive parsing (hostile corpus):**
 
-- Rejected: absolute paths, `..`, single-`./` prefixes, trailing slashes, empty path segments, path > 1024 bytes, Windows drive letters, UNC prefixes, NTFS ADS colons, hardlinks, symlinks, FIFOs, device files, sparse files, pax headers with semantic side effects, extended attributes, duplicate paths after NFC normalization, case-insensitive collisions on HFS+/NTFS hosts, zero-byte files where descriptor declares non-zero size, non-regular-file entry types.
+- Rejected: absolute paths, `..`, single-`./` prefixes, trailing slashes, empty path segments, path > 1024 bytes, Windows drive letters, UNC prefixes, NTFS ADS colons, hardlinks, symlinks, FIFOs, device files, sparse files, any pax extended-header entry (tar type `x`), any global pax header (tar type `g`), extended attributes, duplicate paths after NFC normalization, case-insensitive collisions on HFS+/NTFS hosts, zero-byte files where descriptor declares non-zero size, non-regular-file entry types.
 - Rejected decompression bombs: streaming output exceeds 100 MiB cap; running output/input ratio exceeds 20:1 mid-stream; nested compression.
 - Accepted: normal regular-file entries with NFC-normalized UTF-8 paths and declared modes.
 
@@ -828,6 +849,7 @@ These are implementation choices; resolving them does not change any contract in
 | 2026-04-19 | V0.6 fifth-round Copilot fixes. | Fixed 7 more issues on PR #1: (a) state persistence reframed as an **append-only `journal.jsonl`** as the source of truth, with `state.json` as a derived snapshot/cache written only after successful journal append — reconciles the "single state.json per install" vs. "append-only JSONL journal" contradiction; (b) L4 acceptance test #1 ("unsigned bundle") now maps to `descriptor-tar-mismatch` (structural rejection at `received`) consistent with the per-state contract — was incorrectly `signature-invalid`; (c) expanded `descriptor.json` schema example to include **bundle-identity fields** (`display_name`, `description`, `publisher_display_name`, `identity_method`) and top-level **`executables` list** — these are referenced by later verification and commit-time mode logic but were absent from the example; (d) `capability_summary` reframed as a **flat sorted list** with an explicit review-record schema + canonical sort order, and the review UI MUST derive the displayed tree deterministically from the list (resolves "flat list" vs "full tree" inconsistency); (e) "no file materialized before verification" invariant tightened to the actual acceptance check (`path, size, sha256` tuple + media_type allowlist; `mode` explicitly excluded); (f) archive-layout comment aligned to DSSE's standard `payloadType` field name (was `payload_type` snake_case); (g) operator-trust cert-validity now evaluated at **install-time wall clock** — Rekor/integrated-time exception scoped to `identity_method: sigstore`; operator-trust has no equivalent timestamping in V1. No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.7 sixth-round Copilot fixes. | Fixed 4 more issues on PR #1: (a) **install state diagram simplified** — removed `deactivated` / `deleted` / "any terminal state" transitions from the install state machine (which ends at `activated`); post-install bundle lifecycle (deactivate → delete → re-activate) is explicitly a separate state machine owned by §"Revocation — deactivate first, delete later" and not part of `journal.jsonl`; (b) install-event references inside per-state contracts now use fully-qualified `plugin.*` names (e.g., `plugin.install-requested` rather than `install-requested`) to match the registry and audit-log spec exactly; (c) `bundle_hash` defined unambiguously as `SHA-256(DSSE payload bytes)` with an explicit requirement that those bytes be RFC 8785 / JCS-canonical (enforced by the self-check) — equivalence to `SHA-256(canonical_json(descriptor))` is noted as a consequence, not the definition; (d) Rekor-entry field naming aligned: audit event uses `rekor_entry_uuid` matching `signature.dsse`'s `verification_material.rekor.entry_uuid` for unambiguous log correlation (was `rekor_entry_id`). No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.8 seventh-round Copilot fixes. | Fixed 3 more issues on PR #1, all structural-check placement: (a) **required-metadata structural check moved to `received`** — the "exactly one `descriptor.json` + one `signature.dsse` at archive root, anything else under `payloads/**`" rule now lives in the `received`-state contract as an explicit step before the extract-to-memory step, removing the earlier circular precondition (previous draft extracted first then asserted existence in `descriptor-verified`); the corresponding line in `descriptor-verified` now documents that structural preconditions are satisfied by `received` and focuses on the payloads-only bijection; (b) L4 test #1 parenthetical updated to reference the `received`-state contract (was still pointing at `descriptor-verified`); (c) Rekor time-field naming aligned: sigstore verification prose now uses `integrated_time_unix` matching the `signature.dsse` wrapper field exactly (was `integrated_time`). No contract changes to downstream sub-specs. |
+| 2026-04-19 | V0.9 eighth-round Copilot fixes. | Fixed 5 more issues on PR #1, two of them materially tightening the security model: (a) **pax not permitted in V1** — replaced vague "pax headers with semantic side effects" with hard rule: any pax extended-header entry (tar type `x`) or global pax header (type `g`) → bundle rejection; no pax key is ever honored for `path`/`linkpath`/`size`/`mtime`/uid/gid/sparse/etc. Only non-pax regular-file entries are accepted; (b) **authoritative on-disk location model added** — `installs/<install_event_id>/payload/` is staging-only; on `staged → committed` the payload is atomically renamed to the canonical content-addressable path `bundles/<bundle_hash>/`; all uninstall/rollback/deactivate/delete operations resolve via `bundle_hash`, not per-`install_event_id`. Multiple install events producing the same `bundle_hash` share one canonical on-disk payload (dedup). Rollback moves from `bundles/` to `rolled-back-bundles/`; delete moves to `revoked-bundles/`. Re-activation requires canonical payload still present; (c) **`bundle_identity` grammar made normative** — `publisher_id` and `bundle_id` restricted to ASCII lowercase + digits + interior `-`, max 64 bytes per segment; exact byte comparison; no Unicode normalization, case-folding, or confusable-mapping during verification; invalid syntax is rejected (never normalized). Defeats the confusable/case-fold attack surface Copilot flagged in earlier L2 tests; (d) **ECDSA "nonrandom k" removed as verifier rule** — verifiers cannot tell nonce-generation quality from a signature alone. Installer enforces observable properties only (approved curve/digest pairs, DER encoding); RFC 6979 / vetted-library requirement moved to producer-side build-tool policy; (e) **namespace pattern language pinned** — `publisher_namespace_prefixes` renamed to `owned_publisher_ids` and restricted to **literal exact-match list** (no globs, no prefix wildcards); collision detection becomes O(n) simple set-intersection; applies to both operator-trust roots and sigstore identities, collision-checked across the full trust configuration. Richer patterns deferred to V1.5+ with an explicit algorithm. No contract changes to downstream sub-specs. |
 
 ---
 
