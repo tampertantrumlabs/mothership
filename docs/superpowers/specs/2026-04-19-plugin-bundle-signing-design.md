@@ -118,7 +118,7 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same library used for audit log en
 - **Archive parser is the adversary.** Tar entries with duplicate paths, `..`, absolute paths, Windows drive letters / UNC prefixes, NTFS ADS colons, path length > 1024 bytes, non-NFC Unicode, case-insensitive collisions (on case-insensitive hosts), symlinks, hardlinks, FIFOs, device files, pax headers with semantic side effects, or sparse files are all rejected at parse. Only regular-file tar entries are accepted.
 - **Decompression bounds.** Uncompressed descriptor + payloads max 100 MiB in V1 (operator-configurable). Gzip compression ratio > 20:1 is rejected as a decompression-bomb signal before full decompression.
 - **Canonical path comparison.** Paths in `descriptor.entries[]` are compared against tar entries after NFC normalization + forward-slash separators + explicit rejection of any `./` prefix, trailing slash, or empty segment. No ambiguity between `payloads/x/y` and `./payloads/x/y`.
-- **File permissions are operator-owned, not bundle-owned.** Descriptor declares intended mode, but supervisor imposes authoritative modes at commit time (`0644` for files, `0755` for executables explicitly listed in the skill/agent manifest's `executables` field inside the descriptor).
+- **File permissions are operator-owned, not bundle-owned.** Descriptor declares intended mode, but supervisor imposes authoritative modes at commit time (`0644` for files, `0755` only for executable payloads whose paths are explicitly listed in the bundle manifest's `executables` field (`bundle.yaml.executables`), as represented in the descriptor).
 
 ### Why DSSE over a canonical JSON descriptor (rather than a tar+checksums.txt+detached signature)
 
@@ -132,7 +132,7 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same library used for audit log en
 
 ## Manifest schemas
 
-All manifests are YAML. Codegen emits Rust / TypeScript / Python types from a source-of-truth schema (`manifests/schema.yaml`), same pattern as the secrets registry and audit events registry.
+Manifest schemas are authored in YAML. Codegen emits Rust / TypeScript / Python types from a source-of-truth schema (`manifests/schema.yaml`), same pattern as the secrets registry and audit events registry. YAML is authoring-only and does not appear in the installable bundle; the shipped and verified bundle format is the canonical JSON `descriptor.json`, which is the authoritative representation for installers/verifiers.
 
 ### `bundle.yaml` (bundle-level)
 
@@ -246,7 +246,7 @@ decision_schema:                                   # hook must return a value ma
 
 - Every field is typed; missing required fields fail install.
 - Unknown fields fail install (strict mode) rather than being silently ignored. This prevents malicious bundles from smuggling future-version fields past current-runtime validation.
-- Cross-manifest references are validated: `bundle.yaml.skills[i]` must match a `manifests/skills/<name>.yaml` file; agent `skills_invoked` must name skills that exist in this bundle or are already installed.
+- Cross-manifest references are validated at install time against the manifests inlined in `descriptor.json`: any declared skill reference must match a skill manifest present in this bundle, and agent `skills_invoked` entries must name skills that exist in this bundle or are already installed.
 
 ---
 
@@ -355,16 +355,13 @@ Each operator-trusted root CA carries a **trust-level annotation** (in a sidecar
 
 ```yaml
 trust_level: "community" | "verified" | "organization"
-default_grants:                                    # capabilities auto-proposable at install
-  network_outbound: false
-  filesystem_read: false
-  filesystem_write: false
-  shell: false
-  secrets: false
+# Note: V1 does NOT honor any per-root "default_grants" block — pre-suggestion is
+# out in V1. This schema reserves the key for a possible V1.5+ reintroduction
+# gated on design-partner evidence (see §"Trust levels × default-deny interaction (V1)").
 notes: "TT Labs community root; moderate trust."
 ```
 
-Trust-level is **advisory** — it shapes the grant UI (a `verified` bundle's grant prompt pre-suggests "allow network:read"; a `community` bundle pre-suggests nothing). **It does not auto-grant.** Per P7, every grant is an explicit operator action.
+Trust-level is **advisory**. **In V1, trust level is displayed as a badge only — it does not pre-suggest, pre-check, or flag any capability as "recommended"** (see §"Trust levels × default-deny interaction (V1)" below). Per P7, every grant is an explicit operator action. Pre-suggestion UX patterns are revisited in V1.5+ only with design-partner evidence that richer UX does not erode operator decision quality.
 
 ### Multiple publishers in one bundle (not supported V1)
 
@@ -374,7 +371,7 @@ V1 bundles have exactly one publisher signature. Multi-signature bundles (publis
 
 ## Install-time verification — journaled transaction
 
-Install is a **journaled state machine**, not a sequence of ad-hoc steps. Each state transition is durable, idempotent, crash-recoverable, and emits an audit event. Only one terminal state (`activated`) makes the bundle's manifests observable to Broker (T3) and Skill process isolation (T4).
+Install is a **journaled state machine**, not a sequence of ad-hoc steps. Each state transition is durable, idempotent, and crash-recoverable; install flow audit events are emitted for the defined install-event milestones declared later in this spec (`install-requested`, `signature-verified`, `signature-failed`, `install-approved`, `install-rejected`, `uninstalled`). Only one terminal state (`activated`) makes the bundle's manifests observable to Broker (T3) and Skill process isolation (T4).
 
 ### States
 
@@ -395,7 +392,7 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 **`received`** — the `.mship` archive has been placed in a quarantine directory at `installs/<install_event_id>/archive.mship`. No further files have been written. An `install-requested` audit event is emitted. The archive is not yet trusted.
 
 - Size check: reject if > 100 MiB (V1 default; operator-configurable). → `rejected(size-exceeded)`.
-- Gzip ratio pre-check: if gzip ratio would exceed 20:1 on header inspection, → `rejected(decompression-bomb)` without full decompression.
+- Decompression-bomb check: do not rely on gzip header inspection for uncompressed size (gzip's `ISIZE` is optional and 32-bit-truncated). Instead, stream-decompress the gzip layer into the tar parser with (a) a hard maximum on total decompressed bytes (100 MiB V1 default, operator-configurable) and (b) a running output/input ratio check; abort as soon as output exceeds the max or the running ratio exceeds 20:1. → `rejected(decompression-bomb)` without completing decompression or writing payload files to disk.
 - Archive parse: stream-parse tar entries, rejecting any non-regular-file entry, any disallowed path shape, any duplicate path. Every accepted tar entry is hashed on-the-fly. Only two files are extracted to memory: `descriptor.json` and `signature.dsse`. Payload files are NOT written to disk yet; their hashes are retained for the next state.
 - Transition → `descriptor-verified` or `rejected(path-escape|duplicate-entry|tar-structural|…)`.
 
@@ -424,7 +421,7 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 
 - For each `descriptor.entries[]` object: re-open the tar archive, stream the entry's bytes, compute SHA-256 progressively, compare against declared hash, write to a temp path in `payload/.partial/`, fsync, rename atomically to `payload/<path>` only on full-match.
 - Any per-entry mismatch → `rejected(entry-hash-mismatch)`; all partially-materialized files are deleted; the tarball stays in quarantine for operator inspection.
-- Modes are applied **after** content verification: `chmod 0644` by default, `0755` for entries listed in declared executables field within an embedded skill/agent manifest.
+- Modes are applied **after** content verification: `chmod 0644` by default, `0755` only for entries whose paths appear in the bundle manifest's `executables` field (`bundle.yaml.executables`) as represented in the descriptor.
 - Transition → `committed`.
 
 **`committed`** — the bundle's manifests are registered with the supervisor's verified-manifest registry, grants are recorded in the grant ledger (from `reviewed` state's approvals), and the broker has **not yet** been told about them. This is the last rollback point.
@@ -466,7 +463,8 @@ Declared here for import into the audit log's event registry:
 
 - `plugin.install-requested` — `{install_event_id, archive_sha256, archive_size}`
 - `plugin.signature-verified` — `{install_event_id, bundle_hash, publisher_id, algorithm, publisher_cert_fingerprint, identity_method, trust_root_fingerprint?, sigstore_identity_subject?, rekor_entry_id?}`
-- `plugin.install-rejected` — `{install_event_id, bundle_hash?, bundle_id?, version?, state_at_rejection, reason_code, reason_detail}` where `reason_code` is an enum (`size-exceeded`, `decompression-bomb`, `path-escape`, `duplicate-entry`, `tar-structural`, `descriptor-archive-mismatch`, `signature-invalid`, `chain-untrusted`, `sigstore-trust-incomplete`, `cert-expired`, `cert-not-yet-valid`, `cert-revoked`, `revocation-check-unavailable`, `publisher-namespace-not-owned`, `rekor-proof-invalid`, `oidc-identity-not-allowlisted`, `manifest-schema-invalid`, `manifest-cross-ref-invalid`, `descriptor-tar-mismatch`, `entry-hash-mismatch`, `operator-rejected`, `operator-timeout`, `registry-txn-failed`).
+- `plugin.signature-failed` — `{install_event_id, bundle_hash?, publisher_id?, algorithm?, publisher_cert_fingerprint?, identity_method?, reason_code, reason_detail}` where `reason_code` is an enum subset limited to signature-verification-path failures: `signature-invalid`, `algorithm-mismatch`, `chain-untrusted`, `sigstore-trust-incomplete`, `cert-expired`, `cert-not-yet-valid`, `cert-revoked`, `revocation-check-unavailable`, `publisher-namespace-not-owned`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `rekor-proof-invalid`, `oidc-identity-not-allowlisted`. Emitted at the `descriptor-verified` boundary when the signature-verification path aborts; the terminal `install-rejected` follows with the same `reason_code`.
+- `plugin.install-rejected` — `{install_event_id, bundle_hash?, bundle_id?, version?, state_at_rejection, reason_code, reason_detail}` where `reason_code` is the full enum (`size-exceeded`, `decompression-bomb`, `path-escape`, `duplicate-entry`, `tar-structural`, `descriptor-archive-mismatch`, `signature-invalid`, `algorithm-mismatch`, `chain-untrusted`, `sigstore-trust-incomplete`, `cert-expired`, `cert-not-yet-valid`, `cert-revoked`, `revocation-check-unavailable`, `publisher-namespace-not-owned`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `rekor-proof-invalid`, `oidc-identity-not-allowlisted`, `manifest-schema-invalid`, `manifest-cross-ref-invalid`, `descriptor-tar-mismatch`, `entry-hash-mismatch`, `bundle-already-installed`, `operator-rejected`, `operator-timeout`, `registry-txn-failed`). This remains the terminal install-failure event, including cases preceded by `plugin.signature-failed`.
 - `plugin.install-approved` — `{install_event_id, bundle_hash, bundle_id, version, publisher_id, publisher_cert_fingerprint, identity_method, trust_level, grants_approved: [capability]}` (emitted at `activated`)
 - `plugin.uninstalled` — `{bundle_hash, bundle_id, reason: "operator" | "operator-rollback" | "revoked-publisher" | "superseded-by-version", grants_revoked: [capability]}`
 
@@ -557,7 +555,7 @@ Trust-level annotation is still useful for revocation policy selection and audit
 **Archive parsing (hostile corpus):**
 
 - Rejected: absolute paths, `..`, single-`./` prefixes, trailing slashes, empty path segments, path > 1024 bytes, Windows drive letters, UNC prefixes, NTFS ADS colons, hardlinks, symlinks, FIFOs, device files, sparse files, pax headers with semantic side effects, extended attributes, duplicate paths after NFC normalization, case-insensitive collisions on HFS+/NTFS hosts, zero-byte files where descriptor declares non-zero size, non-regular-file entry types.
-- Rejected decompression bombs: gzip ratio > 20:1, nested compression, header-declared uncompressed size > configured max.
+- Rejected decompression bombs: streaming output exceeds 100 MiB cap; running output/input ratio exceeds 20:1 mid-stream; nested compression.
 - Accepted: normal regular-file entries with NFC-normalized UTF-8 paths and declared modes.
 
 **Descriptor↔archive binding:**
@@ -655,7 +653,7 @@ Expanded to 15 scenarios, all must pass:
 11. **Sigstore bundle with Rekor proof for different content** → `rekor-proof-invalid`.
 12. **Sigstore bundle with OIDC issuer mismatch** → `oidc-identity-not-allowlisted`.
 13. **Publisher-namespace collision attempt** (cert chains to a root, but publisher_id is outside that root's `publisher_namespace_prefixes`) → `publisher-namespace-not-owned`.
-14. **Decompression bomb** (gzip ratio exceeds 20:1 on header check) → `decompression-bomb` at `received`.
+14. **Decompression bomb** (streaming output exceeds cap or running ratio exceeds 20:1 mid-stream) → `decompression-bomb` at `received`; no payload byte materialized.
 15. **Crash-during-install recovery** (power-fail after `descriptor-verified` but before `reviewed`) → on supervisor restart, install state is resumed or rolled back cleanly; no partial install visible to broker.
 
 For each scenario: rejection audit entry carries the correct `reason_code`, the correct `state_at_rejection`, no bundle content leak into audit log (reason_detail is taint-safe), and no partial filesystem side effects remain on abort paths.
@@ -668,13 +666,13 @@ P3's runtime half: *"a signed skill cannot exceed its declared manifest at runti
 
 ## Error modes
 
-- **Corrupted archive** → `install-rejected(size-exceeded|path-escape|checksum-mismatch)`. Quarantine retained for operator inspection.
+- **Corrupted archive** → `install-rejected(size-exceeded|path-escape|descriptor-tar-mismatch|entry-hash-mismatch)`. Quarantine retained for operator inspection.
 - **Unknown publisher** → `install-rejected(chain-untrusted)`. No bundle state persists.
 - **Expired cert** (non-sigstore) → rejected. Sigstore path accepts if Rekor confirms valid-at-signing.
 - **Clock skew** (local clock ahead of cert Not Before) → rejected with `cert-not-yet-valid`; operator diagnostic recommends NTP.
 - **Cert-store inaccessible at startup** → supervisor halts with actionable diagnostic. No bundles loadable; P7 preserved.
 - **Revocation polling endpoint down** → alerting in non-strict mode; install proceeds. In strict mode, install aborts with `revocation-check-unavailable`.
-- **Manifest parse error** → `install-rejected(manifest-schema-invalid)` with line/field detail in reason_detail.
+- **Manifest parse error** → `install-rejected(manifest-schema-invalid)` with `reason_detail` limited to sanitized location metadata (for example, a JSON-pointer-like field path and optional line/column), plus at most an opaque hash/fingerprint of the offending value. Raw parser output, manifest snippets, and offending values MUST NOT be copied into `reason_detail`.
 - **Quarantine write failure** (disk full) → supervisor halts install; bundle returned to operator unchanged.
 
 ---
@@ -685,7 +683,7 @@ P3's runtime half: *"a signed skill cannot exceed its declared manifest at runti
 - **Verified-manifest objects** — typed structs with `bundle_hash`, `publisher_id`, `publisher_cert_fingerprint`, `trust_level`, `identity_method`, and typed skill/agent/hook data. Consumed by Supervisor (T2) for the manifest registry and Broker (T3) for capability-matrix evaluation.
 - **Install-event audit shapes** — exported to `audit-events.yaml` as declared above.
 - **`mothership plugin` CLI subcommands** — `install <path-to-mship>`, `list`, `inspect <bundle_id>`, `uninstall <bundle_id>`, `revoke <cert-fingerprint>`, `revocations`, `revoke-remove <fingerprint>`, `quarantine list`, `quarantine purge`, `trust add <root.pem>`, `trust list`, `trust remove <fingerprint>`.
-- **`MThip\bundle` build helpers** — a V1.5+ CLI `mothership-bundle-tool build <source-tree>` that produces signed `.mship` bundles; design forthcoming but the bundle format in this spec is the artifact it must emit.
+- **Mothership bundle build helpers** — a V1.5+ CLI `mothership-bundle-tool build <source-tree>` that produces signed `.mship` bundles; design forthcoming but the bundle format in this spec is the artifact it must emit.
 
 ---
 
@@ -739,6 +737,7 @@ These are implementation choices; resolving them does not change any contract in
 |------|--------|--------|
 | 2026-04-19 | V0 design drafted (Gavin + Cowork). | Third sub-spec authored under the V1 spec map (T1, design Phase I). Resolves `design-principles.md` open question 2 (signing authority = operator-local trust + optional sigstore; no Mothership CA in V1). |
 | 2026-04-19 | V0.1 revision post-Codex review. | Switched from `checksums.txt` + detached signature to **DSSE envelope over a canonical JSON descriptor** (eliminates canonicalization drift; binds all manifests + file metadata in a single signed subject). Reframed install as a **journaled state machine** (`received → descriptor-verified → reviewed → staged → committed → activated`) with crash-recoverable transitions and no payload materialization before descriptor verification. Added **publisher-namespace constraints** on trust roots (prevents two roots both issuing the same publisher_id). **Dropped trust-level grant pre-suggestion** in V1 (Codex flagged rubber-stamping risk; badges-only for now, revisit in V1.5 with design-partner evidence). Revocation **split into deactivate / delete / re-activate** phases with operator-presence-gated break-glass for root-level revocations + impact report before deactivation. Expanded sigstore verification to detail Fulcio chain, SCT via CT log keys, Rekor checkpoint consistency, OIDC issuer+subject binding, namespace-constrained sigstore identity allowlist. Replaced YAML-in-bundle with **canonical JSON descriptor** (YAML is authoring-side only; eliminates parser divergence across Rust/TS/Python). Added reason_detail taint rules. 15 L4 acceptance tests, extensive L2 hostile-corpus + differential tests for canonicalization drift. See Codex Review section below. |
+| 2026-04-19 | V0.2 consistency fixes post-Copilot PR review. | Fixed 11 consistency issues flagged by Copilot on PR #1: (a) cross-manifest references point to inlined descriptor manifests, not separate YAML files; (b) declared explicit `plugin.signature-failed` event shape; (c) added missing `reason_code` enum variants (`algorithm-mismatch`, `trust-store-namespace-collision`, `trust-root-removed-mid-install`, `bundle-already-installed`) that were referenced but undeclared; (d) fixed `MThip\bundle` typo; (e) aligned `executables` field at bundle level (not per-manifest); (f) clarified YAML is authoring-only; (g) removed contradictory pre-suggestion language from the publisher-identity section and commented-out `default_grants` in the trust-root annotation schema; (h) replaced gzip-header-inspection decompression-bomb check with streaming-ratio + max-byte-cap approach (ISIZE is unreliable); (i) softened "each state transition emits audit event" overstatement; (j) aligned "corrupted archive" error-mode terminology to actual enum codes; (k) constrained manifest-parse-error `reason_detail` to sanitized location + opaque hash per taint rules. No contract changes to downstream sub-specs. |
 
 ---
 
