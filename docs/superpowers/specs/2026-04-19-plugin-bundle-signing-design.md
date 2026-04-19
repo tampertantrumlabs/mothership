@@ -61,7 +61,7 @@ This inverts the earlier checksums-file approach: the descriptor payload inside 
 
 ```
 descriptor.json                 # canonical JSON; the signed subject
-signature.dsse                  # DSSE envelope (JSON): payload_type + signatures + cert chain + optional Rekor bundle
+signature.dsse                  # DSSE envelope (JSON): payloadType + signatures + cert chain + optional Rekor bundle
 payloads/
   skills/<name>/...             # MCP server binary/scripts/assets
   agents/<name>/...             # agent binary/scripts (if bundle ships it)
@@ -80,20 +80,28 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specificatio
   "bundle_identity": {
     "bundle_id": "tamper-tantrum-labs/inbox-triage",
     "version": "1.4.2",
+    "display_name": "Inbox Triage",
+    "description": "Inbox triage agent with per-client isolation.",
     "publisher_id": "tamper-tantrum-labs",
+    "publisher_display_name": "TamperTantrum Labs",
+    "identity_method": "operator-trust",        /* "operator-trust" | "sigstore" — which verification path applies */
     "created_at": "2026-04-19T14:32:00Z"
   },
   "runtime_constraints": {
     "mship_runtime_min": "1.0.0",
     "supported_platforms": ["linux-x86_64", "darwin-arm64", "windows-x86_64"]
   },
+  "executables": [                               /* authoritative list of payload paths that get 0755 at commit time */
+    "payloads/skills/gmail-mcp/server",
+    "payloads/agents/inbox-triage-reader/bin"
+  ],
   "entries": [
     {
       "path": "payloads/skills/gmail-mcp/server",
       "size": 4917628,
       "sha256": "a9b3c1...",
       "media_type": "application/vnd.mship.skill.binary",
-      "mode": "0755",
+      "mode": "0755",                            /* advisory only; tar-header mode is not verified against this */
       "entry_type": "file"
     }
     /* ... one object per PAYLOAD file (anything under payloads/**); no payload file may
@@ -103,14 +111,30 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specificatio
        hash itself). Their presence and byte-equality is verified by a separate rule
        at descriptor-verified state. */
   ],
-  "skills":  [ /* canonical-JSON-serialized skill manifests, inlined */ ],
+  "skills":  [ /* canonical-JSON-serialized skill manifests, inlined, one per named skill */ ],
   "agents":  [ /* canonical-JSON-serialized agent manifests, inlined */ ],
   "hooks":   [ /* canonical-JSON-serialized hook manifests, inlined */ ],
-  "capability_summary": {
-    /* flattened, sorted list of all declared capabilities across all skills/agents/hooks;
-       used for the install-time review UI. Derivable from the manifests but pre-computed
-       to make the review UI deterministic and audit-reproducible */
-  }
+  "capability_summary": [
+    /* flattened, sorted list of all declared capabilities across all skills/agents/hooks.
+       Each item is a review record with enough information to reconstruct the review tree
+       deterministically, e.g.:
+       {
+         "owner_kind": "skill" | "agent" | "hook",
+         "owner_id": "<manifest name>",
+         "capability_path": ["network", "outbound", "gmail.googleapis.com:443"],
+         "access": "read" | "write" | "exec" | "invoke",
+         "constraints": { ... }
+       }
+
+       Sort order is canonical: owner_kind ASC, owner_id ASC, capability_path lexicographic
+       by segment, then access ASC, then canonical-JSON(constraints) ASC.
+
+       The install-time review UI MUST treat capability_summary as this flat list and derive
+       the displayed review tree by grouping items first by (owner_kind, owner_id) and then
+       by capability_path segments in list order. No renderer may infer additional hierarchy
+       from raw manifests when capability_summary is present. This keeps the review UI
+       deterministic and audit-reproducible while preserving a compact signed representation. */
+  ]
 }
 ```
 
@@ -119,11 +143,11 @@ Canonical-JSON-serialized (RFC 8785 / JCS — same canonicalization specificatio
 ### Invariants
 
 - **Identity = hash of descriptor.** `bundle_hash = SHA-256(canonical_json(descriptor))`. This is what every audit event references. Two archives with identical `descriptor.json` bytes have the same `bundle_hash` regardless of how payloads are arranged on disk inside the tar.
-- **No file materialized before descriptor verification.** Signature is verified → descriptor parsed → Rekor / chain / revocation checks pass → only then is any payload file written to disk, and only if that file's path+hash+size+mode+media_type matches an `entries[]` object exactly.
+- **No file materialized before descriptor verification.** Signature is verified → descriptor parsed → Rekor / chain / revocation checks pass → only then may any payload file be written to disk, and only for a regular-file tar entry whose canonicalized path is in a one-to-one match with an `entries[]` object AND whose `(path, size, sha256)` tuple matches that object exactly. `descriptor.entries[].media_type` is validated as descriptor metadata against the allowed payload-media-type set (and any policy keyed on that value); it is not compared against a tar-header field or inferred from payload bytes during tar↔descriptor matching. Tar-header `mode` is not part of the descriptor↔tar acceptance check.
 - **Archive parser is the adversary.** Tar entries with duplicate paths, `..`, absolute paths, Windows drive letters / UNC prefixes, NTFS ADS colons, path length > 1024 bytes, non-NFC Unicode, case-insensitive collisions (on case-insensitive hosts), symlinks, hardlinks, FIFOs, device files, pax headers with semantic side effects, or sparse files are all rejected at parse. Only regular-file tar entries are accepted.
 - **Decompression bounds.** Uncompressed descriptor + payloads max 100 MiB in V1 (operator-configurable). Gzip compression ratio > 20:1 is rejected as a decompression-bomb signal before full decompression.
 - **Canonical path comparison.** Paths in `descriptor.entries[]` are compared against tar entries after NFC normalization + forward-slash separators + explicit rejection of any `./` prefix, trailing slash, or empty segment. No ambiguity between `payloads/x/y` and `./payloads/x/y`.
-- **File permissions are operator-owned, not bundle-owned.** Descriptor declares intended mode, but supervisor imposes authoritative modes at commit time (`0644` for files, `0755` only for executable payloads whose paths are explicitly listed in the bundle manifest's `executables` field (`bundle.yaml.executables`), as represented in the descriptor).
+- **File permissions are operator-owned, not bundle-owned.** The descriptor may declare an intended mode for audit/policy purposes, but tar-header mode is **not** part of the descriptor↔tar acceptance check and a mode mismatch does not by itself fail install. Supervisor imposes authoritative modes at commit time (`0644` for files, `0755` only for executable payloads whose paths are explicitly listed in the bundle manifest's `executables` field (`bundle.yaml.executables`), as represented in the descriptor).
 
 ### Why DSSE over a canonical JSON descriptor (rather than a tar+checksums.txt+detached signature)
 
@@ -401,7 +425,9 @@ Publisher X.509 cert must carry:
 - `Subject CN` or `URI SAN` — publisher ID matching `bundle.yaml.publisher.id`
 - `Key Usage`: Digital Signature
 - `Extended Key Usage`: `1.3.6.1.4.1.57264.2.1` (Mothership Plugin Signing OID; provisional, to be registered)
-- `Not Before` ≤ signing time; `Not After` ≥ signing time (but cert may be expired by install time if Rekor proves signing time)
+- `Not Before` ≤ install-time wall clock; `Not After` ≥ install-time wall clock
+
+For the operator-trust path, certificate validity is evaluated at **install-time wall clock**. The Rekor/integrated-time exception ("cert may be expired by install time if signing time is proven") applies only to `identity_method: sigstore` (see §"Sigstore-keyless option"). V1 defines no equivalent timestamping mechanism for the operator-trust path; publishers whose certs expire must re-sign their bundles with a current cert.
 
 ### Trust levels
 
@@ -439,7 +465,7 @@ Install is a **journaled state machine**, not a sequence of ad-hoc steps. Each s
                                     └── deleted (after grace period)
 ```
 
-Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/state.json` (platform-equivalent). Supervisor crash between states: on restart, resume from the last durable state; partial side effects are idempotent or explicitly rolled back.
+State persistence uses an **append-only journal** at `/var/lib/mothership/installs/<install_event_id>/journal.jsonl` (platform-equivalent; format defined in §"Journal format" below). Each durable state transition appends one JSON-lines record describing the new state plus enough metadata to resume safely. A derived snapshot `state.json` MAY be maintained at the same path as a cache of the current materialized state, but it is not the source of truth: it MUST be written atomically only after the corresponding journal append succeeds. Supervisor crash between states: on restart, recover by replaying `journal.jsonl` (optionally starting from `state.json` if present and then applying any later journal entries), resume from the last durable state, and apply idempotent or explicitly-rolled-back handling for any partial side effects.
 
 ### Per-state contract
 
@@ -468,7 +494,7 @@ Each state is persisted to `/var/lib/mothership/installs/<install_event_id>/stat
 
 **`reviewed`** — operator has been presented the capability-review UI via sub-spec 7 re-auth gate. Operator has approved or rejected.
 
-- UI displays: publisher identity, identity_method, trust level (informational only — no pre-suggested grants in V1), bundle_id, version, bundle_hash, full capability tree from `descriptor.capability_summary`, per-capability toggle (default off), a final free-text confirm box the operator must type.
+- UI displays: publisher identity, identity_method, trust level (informational only — no pre-suggested grants in V1), bundle_id, version, bundle_hash, and a review tree deterministically derived from the flat `descriptor.capability_summary` list (grouped by `(owner_kind, owner_id)` then by `capability_path` segments per the list's declared sort order; no renderer may infer additional hierarchy from raw manifests), per-capability toggle (default off), a final free-text confirm box the operator must type.
 - Timeout (default 10 minutes) → `rejected(operator-timeout)`.
 - Operator rejection → `rejected(operator-rejected)`.
 - Operator approval → `plugin.install-approved` audit event **NOT yet emitted** (approval is recorded in the journal; the event is emitted at `activated` so the audit log reflects reality only after the bundle is actually live).
@@ -698,7 +724,7 @@ The map's spec-specific acceptance test: *"An unsigned or tamper-modified plugin
 
 Expanded to 15 scenarios, all must pass:
 
-1. **Unsigned bundle** (missing `signature.dsse`) → `signature-invalid`.
+1. **Unsigned bundle** (missing `signature.dsse`) → `descriptor-tar-mismatch` (missing required metadata entry is caught as a structural violation during `received`, before any signature-verification attempt). This is consistent with the structural-check contract in `descriptor-verified`.
 2. **Tampered payload** (byte flip in a `payloads/*` file, descriptor unchanged) → `entry-hash-mismatch` at staging.
 3. **Tampered descriptor** (byte flip in `descriptor.json` entry in archive, signature unchanged) → `descriptor-archive-mismatch`.
 4. **Tampered signature** (byte flip in DSSE envelope signatures field) → `signature-invalid`.
@@ -799,6 +825,7 @@ These are implementation choices; resolving them does not change any contract in
 | 2026-04-19 | V0.3 second-round Copilot fixes. | Fixed 6 additional consistency issues on PR #1: (a) Scope now says "six-state journaled state machine" (was "nine-step procedure" leftover from pre-Codex draft); (b) `descriptor.entries[]` clarified to cover payload files only — `descriptor.json` + `signature.dsse` are structural/signature artifacts excluded from the bijection (circular-dependency note); (c) descriptor↔tar bijection scoped to `payloads/**`; added explicit structural-entry check + `tar-structural` on any non-payload non-metadata entry; (d) `staged` state verification tuple is `(path, size, sha256, media_type)` only — tar-header `mode` is advisory, never fails install; (e) declared `plugin.revocation-impact-reported` audit event shape alongside `plugin.uninstalled`; (f) exit checklist updated from "10 L4 scenarios" to "15 L4 scenarios" to match the L4 count. No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.4 third-round Copilot fixes. | Fixed 7 more issues on PR #1 — all leftover "step N" references from the pre-Codex numbered-step draft and two content-scope fixes: (a) Citations now include UC2 (cited in body for CRL/OCSP strict + grace-period but missing from Citations header); (b) Purpose reworded to scope this sub-spec to manifest-integrity + install-time verification; runtime enforcement explicitly delegated to T4; (c) DSSE PAE shorthand in the bundle-format summary aligned to the normative byte-sequence in §"What is signed"; (d) "step 5 expansion" for sigstore verification re-anchored to the `descriptor-verified` state sub-steps; (e) "Namespace enforcement at step 5" re-anchored to `descriptor-verified`; (f) `staged → committed` mode-application timing clarified: `staged` guarantees content integrity only with no chmod; authoritative modes are imposed on entry to `committed` as part of the commit-time unit of work alongside registry+grants write; (g) Principle compliance table's P7 and P2 rows re-anchored to the `reviewed` state; P8 row count corrected to seven declared event types (was six; `plugin.revocation-impact-reported` was added in V0.3 and the count wasn't updated); trust-level tension reworded to reflect V1's badge-only posture. No contract changes to downstream sub-specs. |
 | 2026-04-19 | V0.5 fourth-round Copilot fixes. | Fixed 5 more issues on PR #1, all structural: (a) **Tier** simplified to just `T1` (runtime relationships already expressed in Upstream/Downstream; "consumes Supervisor + Audit log" phrasing conflated tier with lifecycle); (b) archive-layout section now explicitly says `descriptor.json` is a **required byte-match copy** of the DSSE payload (the DSSE payload is the authoritative cryptographic source) — reconciles "authoritative, signed" language with later "DSSE payload is authoritative" language; (c) added full `signature.dsse` **wrapper format** specification: a JSON object combining a strict DSSE envelope with explicit verification-material fields (cert chain, Rekor proof, timestamps reserved for V1.5+); specifies parser discipline, field constraints, and version framing (DSSE alone does not define cert-chain or Rekor fields; Mothership's superset is now unambiguous); (d) removed library-prescription overreach from descriptor section (library choice is an open implementation question in both audit log and plugin specs; only RFC 8785 canonicalization + shared golden-vector parity is normative); (e) added explicit **canonical-form self-check** at `descriptor-verified` state: parse DSSE payload with duplicate-key rejection, re-serialize via JCS, require byte-equality with original before computing `bundle_hash`; defeats cross-language parser drift at verification time, not just build time. No contract changes to downstream sub-specs. |
+| 2026-04-19 | V0.6 fifth-round Copilot fixes. | Fixed 7 more issues on PR #1: (a) state persistence reframed as an **append-only `journal.jsonl`** as the source of truth, with `state.json` as a derived snapshot/cache written only after successful journal append — reconciles the "single state.json per install" vs. "append-only JSONL journal" contradiction; (b) L4 acceptance test #1 ("unsigned bundle") now maps to `descriptor-tar-mismatch` (structural rejection at `received`) consistent with the per-state contract — was incorrectly `signature-invalid`; (c) expanded `descriptor.json` schema example to include **bundle-identity fields** (`display_name`, `description`, `publisher_display_name`, `identity_method`) and top-level **`executables` list** — these are referenced by later verification and commit-time mode logic but were absent from the example; (d) `capability_summary` reframed as a **flat sorted list** with an explicit review-record schema + canonical sort order, and the review UI MUST derive the displayed tree deterministically from the list (resolves "flat list" vs "full tree" inconsistency); (e) "no file materialized before verification" invariant tightened to the actual acceptance check (`path, size, sha256` tuple + media_type allowlist; `mode` explicitly excluded); (f) archive-layout comment aligned to DSSE's standard `payloadType` field name (was `payload_type` snake_case); (g) operator-trust cert-validity now evaluated at **install-time wall clock** — Rekor/integrated-time exception scoped to `identity_method: sigstore`; operator-trust has no equivalent timestamping in V1. No contract changes to downstream sub-specs. |
 
 ---
 
