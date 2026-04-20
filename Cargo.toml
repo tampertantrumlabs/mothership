@@ -1,0 +1,33 @@
+# Mothership workspace
+# Virtual workspace: individual crates live under crates/ and are added as
+# each lands per the V1 spec map's Phase II build order:
+#   Secrets bridge -> Audit log + Plugin bundle -> Supervisor
+
+[workspace]
+resolver = "3"
+members = []
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/tampertantrumlabs/mothership"
+authors = ["TamperTantrum Labs"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Opt-out of a few pedantic lints that fight normal Rust style:
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+# Placeholder block for per-crate pinning as Phase II build proceeds.
+# All substrate crates pin dependencies here; no floating versions.
