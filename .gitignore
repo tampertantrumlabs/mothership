@@ -22,3 +22,16 @@ venv/
 
 # Node (for tooling)
 node_modules/
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local artifacts
+*.log
+*.tmp
+
+# Build outputs that shouldn't be committed
+/dist
+/build
